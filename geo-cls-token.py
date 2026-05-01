@@ -1,22 +1,30 @@
 """
-BdSL-SPOTER | Geo + Velocity Features  (geo-velocity.py)
-=========================================================
-Based on geo-keypoint-training-v1 with two targeted additions:
+BdSL-SPOTER | CLS Token Aggregation  (geo-cls-token.py)
+========================================================
+Based on geo-keypoint-training-v1 with one targeted change:
 
-  1. Velocity features  (Δ of all 223 dims computed per-frame)
-       Position + Geo  :  223 dims / frame  (loaded from .npz)
-       Velocity (Δ)    :  223 dims / frame  (np.diff along time axis)
-       Total input     :  446 dims / frame
-       Computed AFTER augmentation so augmented velocities are consistent.
-       Directly encodes HOW FAST joints move and HOW FAST angles change.
-       Primary fix for W012↔W016 confusion (same shape, different motion).
+  Replace global average pooling with a BERT-style CLS token.
 
-  2. Shoulder / torso normalised keypoints  (done in keypoint_extraction.py)
-       Requires re-running keypoint_extraction.py → upload new Kaggle dataset
-       → update KEYPOINTS_DIR below to point to that new dataset.
+  v1 (mean pool):
+      feat = x.mean(dim=1)          # (B, 128) — equally weights all 200 frames
+      Problem: preparation/rest frames dilute the peak sign frames.
+               All class mean vectors become very similar → high cosine sim.
+
+  This version (CLS token):
+      cls = self.cls_token.expand(B, -1, -1)     # (B, 1, 128)  learnable
+      x   = torch.cat([cls, x], dim=1)           # (B, 201, 128)
+      x   = self.transformer(x)                  # all frames attend to each other
+      feat = x[:, 0]                             # (B, 128) — CLS attends to ALL frames
+                                                 #            learns order-aware summary
+      Advantage: The CLS token sees both early and late frames through self-attention
+      and learns to summarise the sequence in a direction-aware way, unlike mean pooling
+      which treats every frame uniformly.
+
+  Positional encoding is extended to seq_len + 1 (position 0 = CLS, 1..T = frames).
 
 All other settings are identical to geo-keypoint-training-v1:
-  GRL λ_adv=0.5, no SupCon, D_MODEL=128, 4 Transformer layers.
+  FEATURE_DIM=223 (150 coords + 73 geo), GRL λ_adv=0.5,
+  D_MODEL=128, N_HEADS=8, N_LAYERS=4.
 """
 
 import os, json, time, glob, math
@@ -37,11 +45,9 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-# UPDATE: point to the new Kaggle dataset produced by keypoint_extraction.py
-# after adding shoulder_normalize() (shoulder + torso normalisation).
-KEYPOINTS_DIR = '/kaggle/input/geo-keypoints-shoulder/keypoints'
+KEYPOINTS_DIR = '/kaggle/input/datasets/rafidadib/geo-feature-keypoint/keypoints'
 OUTPUT_DIR    = '/kaggle/working'
-CKPT_DIR      = os.path.join(OUTPUT_DIR, 'checkpoints_geo_vel')
+CKPT_DIR      = os.path.join(OUTPUT_DIR, 'checkpoints_cls')
 os.makedirs(CKPT_DIR, exist_ok=True)
 
 # ── Load config ────────────────────────────────────────────────────────────────
@@ -50,12 +56,9 @@ with open(os.path.join(KEYPOINTS_DIR, 'config.json')) as f:
 
 NUM_CLASSES   = _cfg['num_classes']
 SEQ_LEN       = _cfg['seq_len']
-_BASE_DIM     = _cfg['feature_dim']       # 223 stored on disk
+FEATURE_DIM   = _cfg['feature_dim']
 NUM_LANDMARKS = _cfg['num_landmarks']
 NUM_SIGNERS   = _cfg.get('num_signers', 18)
-
-# Velocity doubles the feature dimension
-FEATURE_DIM   = _BASE_DIM * 2             # 223 (position+geo) + 223 (Δvelocity) = 446
 
 # ── Model hyperparameters  (identical to geo-keypoint-training-v1) ─────────────
 D_MODEL      = 128
@@ -67,21 +70,21 @@ LABEL_SMOOTH = 0.05
 WEIGHT_DECAY = 5e-4
 MAX_EPOCHS   = 80
 PATIENCE     = 15
-BATCH_SIZE   = 64
+BATCH_SIZE   = 32
 MAX_LR       = 3e-4
 SEED         = 42
 RESUME_FROM_CKPT = False
 
-# ── GRL  (same as v1 — λ=0.2) ─────────────────────────────────────────────────
+# ── GRL  (same as v1 — λ=0.5) ─────────────────────────────────────────────────
 USE_GRL     = True
-LAMBDA_ADV  = 0.2
+LAMBDA_ADV  = 0.5
 DISC_HIDDEN = 256
 
 # ── Curriculum disabled (caused collapse in v1) ────────────────────────────────
 CURRICULUM_EPOCHS    = 0
 CURRICULUM_START_LEN = 50
 
-assert D_MODEL % N_HEADS == 0
+assert D_MODEL % N_HEADS == 0, f'D_MODEL ({D_MODEL}) must be divisible by N_HEADS ({N_HEADS})'
 
 torch.manual_seed(SEED)
 np.random.seed(SEED)
@@ -91,15 +94,11 @@ print(f'Device      : {DEVICE}')
 if torch.cuda.is_available():
     print(f'GPU         : {torch.cuda.get_device_name(0)}')
     print(f'VRAM        : {torch.cuda.get_device_properties(0).total_memory/1e9:.1f} GB')
-print(f'\nBase feat dim : {_BASE_DIM}  (position + geo, stored in .npz)')
-print(f'Velocity dim  : {_BASE_DIM}  (Δ of every feature per frame)')
-print(f'FEATURE_DIM   : {FEATURE_DIM}  (446 total fed to model)')
-print(f'D_MODEL       : {D_MODEL}  ({D_MODEL}/{N_HEADS} = {D_MODEL//N_HEADS} per head)')
-print(f'N_LAYERS      : {N_LAYERS}')
-print(f'NUM_CLASSES   : {NUM_CLASSES}')
-print(f'SEQ_LEN       : {SEQ_LEN}')
-print(f'BATCH_SIZE    : {BATCH_SIZE}')
-print(f'LAMBDA_ADV    : {LAMBDA_ADV}   (GRL weight, same as v1)')
+print(f'\nFeature dim : {FEATURE_DIM}')
+print(f'D_MODEL     : {D_MODEL}  ({D_MODEL}/{N_HEADS} = {D_MODEL//N_HEADS} per head)')
+print(f'N_LAYERS    : {N_LAYERS}')
+print(f'NUM_CLASSES : {NUM_CLASSES}')
+print(f'SEQ_LEN     : {SEQ_LEN}  →  Transformer sees {SEQ_LEN + 1} tokens (CLS + frames)')
 
 
 # ── BlazePose L↔R pairs for horizontal flip ────────────────────────────────────
@@ -115,7 +114,7 @@ BLAZE_LR_PAIRS = [
 class BdSLDataset(Dataset):
     def __init__(self, npz_path, augment=False, curriculum_len=None):
         data = np.load(npz_path)
-        self.X  = data['X'].astype(np.float32)          # (N, T, 223)
+        self.X  = data['X'].astype(np.float32)
         self.y  = data['y'].astype(np.int64)
         if 'signer_id' in data:
             self.signer_id = (data['signer_id'].astype(np.int64) - 1)
@@ -125,12 +124,10 @@ class BdSLDataset(Dataset):
         self.curriculum_len = curriculum_len
         has_sid = 'signer_id' in data
         print(f'Loaded {os.path.basename(npz_path)}: '
-              f'X={self.X.shape} (disk), classes={len(np.unique(self.y))}'
-              f', signer_ids={"found" if has_sid else "NOT FOUND"}')
+              f'X={self.X.shape}, classes={len(np.unique(self.y))}'
+              f', signer_ids={"found" if has_sid else "NOT FOUND (GRL will be a no-op)"}')
 
     def __len__(self): return len(self.y)
-
-    # ── Augmentations (operate on the 223-dim stored sequence) ─────────────────
 
     def temporal_dropout(self, seq, p=0.15):
         T    = len(seq)
@@ -215,22 +212,14 @@ class BdSLDataset(Dataset):
         return seq
 
     def __getitem__(self, idx):
-        seq   = self.X[idx].copy()    # (T, 223)
+        seq   = self.X[idx].copy()
         label = self.y[idx]
-
         if self.augment:
-            seq = self.augment_seq(seq)   # augment positions first
-
-        # ── Velocity: Δ of every feature across frames ────────────────────────
-        # prepend=seq[:1] keeps shape (T, 223); frame-0 velocity is 0 by convention.
-        vel = np.diff(seq, axis=0, prepend=seq[:1])   # (T, 223)
-        seq = np.concatenate([seq, vel], axis=-1)     # (T, 446)
-
+            seq = self.augment_seq(seq)
         seq = self.apply_curriculum(seq)
-
-        return (torch.tensor(seq,                        dtype=torch.float32),
-                torch.tensor(label,                      dtype=torch.long),
-                torch.tensor(self.signer_id[idx],        dtype=torch.long))
+        return (torch.tensor(seq,                    dtype=torch.float32),
+                torch.tensor(label,                  dtype=torch.long),
+                torch.tensor(self.signer_id[idx],    dtype=torch.long))
 
 
 # ── GRL helpers ───────────────────────────────────────────────────────────────
@@ -276,6 +265,7 @@ def grl_lambda_schedule(step: int, total_steps: int) -> float:
 # ── Model ─────────────────────────────────────────────────────────────────────
 
 class LearnablePositionalEncoding(nn.Module):
+    """Learnable positional encoding — accepts seq_len tokens (including CLS)."""
     def __init__(self, seq_len, d_model):
         super().__init__()
         self.encoding = nn.Parameter(torch.zeros(1, seq_len, d_model))
@@ -286,16 +276,29 @@ class LearnablePositionalEncoding(nn.Module):
 
 class BdSLSPOTER(nn.Module):
     """
-    BdSL-SPOTER identical to v1 except input_proj accepts FEATURE_DIM=446.
-    Forward returns (sign_logits, signer_logits).
-    signer_logits is None during eval.
+    BdSL-SPOTER with CLS token aggregation (replaces mean pooling in v1).
+
+    Input pipeline:
+      1. input_norm  : LayerNorm(FEATURE_DIM)
+      2. input_proj  : Linear(FEATURE_DIM → d_model)        — (B, T, d_model)
+      3. CLS prepend : cat([cls_token, projected_frames])   — (B, T+1, d_model)
+      4. pos_enc     : LearnablePos(T+1, d_model)           — position 0 = CLS
+      5. transformer : 4× encoder layers
+      6. feat = x[:, 0]  ← CLS output, not mean            — (B, d_model)
+      7. classifier  : 4-layer MLP → num_classes
+
+    Why CLS > mean pooling:
+      The CLS token attends to all T frames through self-attention and learns
+      to summarise in a direction-aware way.  Mean pooling treats every frame
+      (preparation, peak, retraction) with equal weight — this makes all class
+      feature vectors converge toward the same centroid.
     """
 
     def __init__(
         self,
         num_classes=NUM_CLASSES,
         seq_len=SEQ_LEN,
-        feature_dim=FEATURE_DIM,     # 446 (position+geo + velocity)
+        feature_dim=FEATURE_DIM,
         d_model=D_MODEL,
         n_heads=N_HEADS,
         n_layers=N_LAYERS,
@@ -308,8 +311,13 @@ class BdSLSPOTER(nn.Module):
         assert d_model % n_heads == 0
 
         self.input_norm = nn.LayerNorm(feature_dim)
-        self.input_proj = nn.Linear(feature_dim, d_model)   # 446 → 128
-        self.pos_enc    = LearnablePositionalEncoding(seq_len, d_model)
+        self.input_proj = nn.Linear(feature_dim, d_model)
+
+        # ── CLS token (position 0) ─────────────────────────────────────────────
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
+
+        # pos_enc covers seq_len + 1 positions: 0=CLS, 1..seq_len=frames
+        self.pos_enc = LearnablePositionalEncoding(seq_len + 1, d_model)
 
         enc_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=n_heads,
@@ -342,17 +350,23 @@ class BdSLSPOTER(nn.Module):
                 if m.bias is not None: nn.init.zeros_(m.bias)
             elif isinstance(m, nn.LayerNorm):
                 nn.init.ones_(m.weight); nn.init.zeros_(m.bias)
+        # CLS token initialised separately — small non-zero to break symmetry
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
 
-    def forward(self, x):                        # x: (B, T, 446)
-        x    = self.input_norm(x)
-        x    = self.input_proj(x)                # (B, T, 128)
-        x    = self.pos_enc(x)
-        x    = self.transformer(x)               # (B, T, 128)
-        feat = x.mean(dim=1)                     # (B, 128)
+    def forward(self, x):                          # x: (B, T, FEATURE_DIM)
+        x   = self.input_norm(x)
+        x   = self.input_proj(x)                  # (B, T, d_model)
 
-        sign_out   = self.classifier(feat)       # (B, num_classes)
-        signer_out = self.disc(self.grl(feat)) if (self.training and USE_GRL) else None
+        # Prepend CLS token
+        cls = self.cls_token.expand(x.size(0), -1, -1)  # (B, 1, d_model)
+        x   = torch.cat([cls, x], dim=1)          # (B, T+1, d_model)
 
+        x    = self.pos_enc(x)                    # (B, T+1, d_model)
+        x    = self.transformer(x)                # (B, T+1, d_model)
+        feat = x[:, 0]                            # (B, d_model) — CLS output only
+
+        sign_out   = self.classifier(feat)
+        signer_out = self.disc(self.grl(feat)) if (USE_GRL and self.training) else None
         return sign_out, signer_out
 
 
@@ -398,12 +412,10 @@ def train_one_epoch(model, loader, optimizer, scheduler, scaler,
 
         with autocast():
             sign_logits, signer_logits = model(X)
-
             l_ce  = criterion(sign_logits, y)
             l_adv = disc_criterion(signer_logits, signer_ids) \
                     if (USE_GRL and signer_logits is not None) \
                     else torch.tensor(0.0, device=DEVICE)
-
             loss = l_ce + LAMBDA_ADV * l_adv
 
         scaler.scale(loss).backward()
@@ -446,15 +458,18 @@ def evaluate(model, loader, criterion):
         correct      += (sign_logits.argmax(1) == y).sum().item()
         correct_top5 += (top5 == y.unsqueeze(1)).any(1).sum().item()
         total        += X.size(0)
-        all_preds.extend(sign_logits.argmax(1).cpu().numpy())
-        all_labels.extend(y.cpu().numpy())
+        all_preds.append(sign_logits.argmax(1).detach())
+        all_labels.append(y.detach())
+
+    all_preds  = torch.cat(all_preds).cpu().numpy()
+    all_labels = torch.cat(all_labels).cpu().numpy()
 
     return {
         'loss':     total_loss / total,
         'top1_acc': correct / total,
         'top5_acc': correct_top5 / total,
-        'preds':    np.array(all_preds),
-        'labels':   np.array(all_labels),
+        'preds':    all_preds,
+        'labels':   all_labels,
     }
 
 
@@ -484,7 +499,7 @@ def load_latest_ckpt(model, optimizer, scheduler, scaler):
         try:
             model.load_state_dict(ckpt['model_state'])
         except RuntimeError as e:
-            print(f'  [WARN] {os.path.basename(fpath)}: mismatch — starting fresh.')
+            print(f'  [WARN] {os.path.basename(fpath)}: architecture mismatch — starting fresh.')
             print(f'  Detail: {str(e)[:120]}')
             return 0, 0.0, 0
         try:
@@ -507,7 +522,6 @@ def load_latest_ckpt(model, optimizer, scheduler, scaler):
 
 if __name__ == '__main__':
 
-    # ── Compute training steps ─────────────────────────────────────────────────
     _tmp = np.load(os.path.join(KEYPOINTS_DIR, 'train.npz'))
     N_TRAIN = len(_tmp['y'])
     if 'signer_id' not in _tmp.files:
@@ -516,7 +530,6 @@ if __name__ == '__main__':
     STEPS_PER_EPOCH = N_TRAIN // BATCH_SIZE
     TOTAL_STEPS     = MAX_EPOCHS * STEPS_PER_EPOCH
 
-    # ── Build model ────────────────────────────────────────────────────────────
     model          = BdSLSPOTER().to(DEVICE)
     optimizer      = AdamW(model.parameters(), lr=MAX_LR / 10, weight_decay=WEIGHT_DECAY)
     criterion      = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTH)
@@ -533,14 +546,12 @@ if __name__ == '__main__':
     print(f'Train size  : {N_TRAIN}  |  steps/epoch: {STEPS_PER_EPOCH}')
     print(f'GRL         : USE_GRL={USE_GRL}  λ_adv={LAMBDA_ADV}  n_signers={NUM_SIGNERS}')
 
-    # ── Resume ────────────────────────────────────────────────────────────────
+    best_model_path = os.path.join(OUTPUT_DIR, 'best_bdsl_cls_token.pt')
     start_epoch, best_val_acc, patience_counter = \
         load_latest_ckpt(model, optimizer, scheduler, scaler)
 
-    best_model_path = os.path.join(OUTPUT_DIR, 'best_bdsl_geo_velocity.pt')
     train_loader, val_loader, _ = get_dataloaders()
-
-    history    = {'train_loss': [], 'val_acc': [], 'val_top5': []}
+    history    = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': [], 'val_top5': []}
     start_time = time.time()
     global_step = start_epoch * STEPS_PER_EPOCH
 
@@ -558,6 +569,8 @@ if __name__ == '__main__':
         ep_time = time.time() - ep_start
 
         history['train_loss'].append(train_loss)
+        history['train_acc'].append(train_acc)
+        history['val_loss'].append(vm['loss'])
         history['val_acc'].append(vm['top1_acc'])
         history['val_top5'].append(vm['top5_acc'])
 
@@ -569,8 +582,12 @@ if __name__ == '__main__':
             best_val_acc = vm['top1_acc']
             torch.save({'model_state': model.state_dict(),
                         'epoch': epoch + 1,
-                        'val_top1': best_val_acc}, best_model_path)
-            print(f'  ★ New best → {best_val_acc*100:.2f}%  (best_bdsl_geo_velocity.pt)')
+                        'val_top1': best_val_acc,
+                        'val_top5': vm['top5_acc'],
+                        'feature_dim': FEATURE_DIM,
+                        'seq_len': SEQ_LEN,
+                        'num_classes': NUM_CLASSES}, best_model_path)
+            print(f'  ★ New best → {best_val_acc*100:.2f}%  (best_bdsl_cls_token.pt)')
             patience_counter = 0
         else:
             patience_counter += 1
@@ -591,16 +608,15 @@ if __name__ == '__main__':
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     axes[0].plot(ep, history['train_loss'], 'b-o', markersize=4)
     axes[0].set_title('Training Loss'); axes[0].set_xlabel('Epoch'); axes[0].grid(alpha=0.3)
-    axes[1].plot(ep, [v * 100 for v in history['val_acc']], 'r-o', markersize=4,
-                 label='Val Top-1')
+    axes[1].plot(ep, [v * 100 for v in history['val_acc']], 'r-o', markersize=4, label='Val Top-1')
     axes[1].axhline(best_val_acc * 100, color='gray', linestyle='--',
                     label=f'Best {best_val_acc*100:.2f}%')
-    axes[1].set_title('Validation Accuracy'); axes[1].set_xlabel('Epoch')
+    axes[1].set_title('Validation Accuracy (CLS Token)'); axes[1].set_xlabel('Epoch')
     axes[1].set_ylabel('Accuracy (%)'); axes[1].legend(); axes[1].grid(alpha=0.3)
     plt.tight_layout()
-    plt.savefig(os.path.join(OUTPUT_DIR, 'training_curves_geo_vel.png'), dpi=120)
+    plt.savefig(os.path.join(OUTPUT_DIR, 'training_curves_cls.png'), dpi=120)
     plt.close()
-    print('Training curves → training_curves_geo_vel.png')
+    print('Training curves → training_curves_cls.png')
 
     # ── Test evaluation ────────────────────────────────────────────────────────
     ckpt = torch.load(best_model_path, map_location=DEVICE)
@@ -615,7 +631,7 @@ if __name__ == '__main__':
     macro_f1 = f1_score(tm['labels'], tm['preds'], average='macro')
 
     print('\n' + '=' * 45)
-    print('  TEST SET RESULTS')
+    print('  TEST SET RESULTS  [CLS Token]')
     print('=' * 45)
     print(f'  Top-1 Accuracy : {tm["top1_acc"]*100:.2f}%')
     print(f'  Top-5 Accuracy : {tm["top5_acc"]*100:.2f}%')
@@ -623,22 +639,23 @@ if __name__ == '__main__':
     print('=' * 45)
 
     results = {
-        'test_top1':     float(tm['top1_acc']),
-        'test_top5':     float(tm['top5_acc']),
-        'macro_f1':      float(macro_f1),
+        'test_top1':      float(tm['top1_acc']),
+        'test_top5':      float(tm['top5_acc']),
+        'macro_f1':       float(macro_f1),
         'best_val_epoch': int(ckpt['epoch']),
-        'best_val_top1': float(ckpt['val_top1']),
-        'feature_dim':   FEATURE_DIM,
-        'base_dim':      _BASE_DIM,
-        'lambda_adv':    LAMBDA_ADV,
-        'num_classes':   NUM_CLASSES,
-        'changes_vs_v1': ['velocity_features_446dim', 'shoulder_torso_normalization'],
+        'best_val_top1':  float(ckpt['val_top1']),
+        'd_model':        D_MODEL,
+        'n_heads':        N_HEADS,
+        'n_layers':       N_LAYERS,
+        'feature_dim':    FEATURE_DIM,
+        'num_classes':    NUM_CLASSES,
+        'aggregation':    'cls_token',
+        'changes_vs_v1':  ['cls_token_replaces_mean_pool', 'pos_enc_seq_len+1'],
     }
-    with open(os.path.join(OUTPUT_DIR, 'test_results_geo_vel.json'), 'w') as f:
+    with open(os.path.join(OUTPUT_DIR, 'test_results_cls.json'), 'w') as f:
         json.dump(results, f, indent=2)
-    print('Results → test_results_geo_vel.json')
+    print('Results → test_results_cls.json')
 
-    # ── Load label map ─────────────────────────────────────────────────────────
     with open(os.path.join(KEYPOINTS_DIR, 'label_map.json')) as _f:
         _label_map = json.load(_f)
 
@@ -653,11 +670,11 @@ if __name__ == '__main__':
     ax.set_xticks(range(NUM_CLASSES)); ax.set_xticklabels(word_labels, rotation=90, fontsize=7)
     ax.set_yticks(range(NUM_CLASSES)); ax.set_yticklabels(word_labels, fontsize=7)
     ax.set_xlabel('Predicted'); ax.set_ylabel('True')
-    ax.set_title(f'Test Confusion Matrix  top-1={tm["top1_acc"]*100:.1f}%', fontsize=13)
+    ax.set_title(f'Test Confusion Matrix [CLS Token]  top-1={tm["top1_acc"]*100:.1f}%', fontsize=13)
     plt.tight_layout()
-    plt.savefig(os.path.join(OUTPUT_DIR, 'confusion_matrix_geo_vel.png'), dpi=120)
+    plt.savefig(os.path.join(OUTPUT_DIR, 'confusion_matrix_cls.png'), dpi=120)
     plt.close()
-    print('Confusion matrix → confusion_matrix_geo_vel.png')
+    print('Confusion matrix → confusion_matrix_cls.png')
 
     # ── Per-class accuracy ─────────────────────────────────────────────────────
     print('\n' + '=' * 60)
@@ -685,3 +702,38 @@ if __name__ == '__main__':
     print(f'  Good    (≥95%)  : {good} classes')
     print(f'  Poor    (<50%)  : {poor} classes')
     print('=' * 60)
+
+    # ── Top confusion pairs ────────────────────────────────────────────────────
+    print('\n' + '=' * 60)
+    print('  TOP-10 CONFUSION PAIRS  (true → predicted, n times)')
+    print('=' * 60)
+    cm_nodiag = cm.copy(); np.fill_diagonal(cm_nodiag, 0)
+    flat_idx  = np.argsort(cm_nodiag.ravel())[::-1][:10]
+    for k, fi in enumerate(flat_idx):
+        ti, pi = divmod(fi, NUM_CLASSES)
+        n = cm_nodiag[ti, pi]
+        if n == 0: break
+        print(f'  {k+1:>2}. {word_labels[ti]:>8} → {word_labels[pi]:<8}  ({n}×)')
+
+    # ── Inference speed ────────────────────────────────────────────────────────
+    model.eval()
+    dummy = torch.randn(1, SEQ_LEN, FEATURE_DIM).to(DEVICE)
+    for _ in range(20):
+        with torch.no_grad(): model(dummy)
+    if torch.cuda.is_available(): torch.cuda.synchronize()
+    t0 = time.time()
+    for _ in range(300):
+        with torch.no_grad(): model(dummy)
+    if torch.cuda.is_available(): torch.cuda.synchronize()
+    fps      = 300 / (time.time() - t0)
+    model_mb = os.path.getsize(best_model_path) / 1e6
+
+    print('\n' + '=' * 45)
+    print('  COMPUTATIONAL EFFICIENCY')
+    print('=' * 45)
+    print(f'  Parameters  : {total_params/1e6:.3f} M')
+    print(f'  Model size  : {model_mb:.1f} MB')
+    print(f'  Inference   : {fps:.0f} FPS  ({DEVICE})')
+    print(f'  Train time  : {total_min:.1f} min')
+    print('=' * 45)
+    print(f'\nAll outputs → {OUTPUT_DIR}')
